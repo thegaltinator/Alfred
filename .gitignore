@@ -1,0 +1,101 @@
+# Alfred - .gitignore
+# Protect sensitive files and build artifacts
+
+# Environment files and API keys
+.env
+*.env
+.env.local
+.env.development
+.env.test
+.env.production
+.envrc
+
+# API Keys and Secrets
+*key*
+*secret*
+*.pem
+*.key
+*.crt
+*.p12
+
+# Sensitive configuration
+config/secrets/
+secrets/
+credentials/
+
+# Build artifacts and caches
+.build/
+build/
+dist/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+DerivedData/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node.js (if any)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+dump.rdb
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+.cache/
+
+# Cloud credentials
+.aws/
+.gcp/
+.azure/
+
+# Keys for external services
+cerebras_key.txt
+openai_key.txt
+github_key.txt
+
+# Alfred specific
+Application Support/Alfred/Models/*.gguf  # Large model files
+Application Support/Alfred/*.db
+Library/Application Support/Alfred/memory.db

@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
+
+	"alfred-cloud/streams"
 )
 
 type HealthResponse struct {
@@ -17,12 +23,32 @@ type HealthResponse struct {
 
 const VERSION = "0.0.1"
 
+var productivityStream string
+
 func main() {
+	ctx := context.Background()
+	redisClient, err := streams.Init(ctx)
+	if err != nil {
+		log.Fatalf("failed to initialize redis: %v", err)
+	}
+	defer redisClient.Close()
+
+	log.Printf("Redis connected (%s)", redisClient.Options().Addr)
+
+	userID := strings.TrimSpace(os.Getenv("ALFRED_USER_ID"))
+	if userID == "" {
+		userID = "dev:test"
+	}
+	productivityStream = fmt.Sprintf("user:%s:in:productivity", userID)
+
+	log.Printf("Productivity stream: %s", productivityStream)
+
 	r := mux.NewRouter()
 
 	// Health check endpoint
 	r.HandleFunc("/healthz", healthHandler).Methods("GET")
 	r.HandleFunc("/", rootHandler).Methods("GET")
+	r.HandleFunc("/prod/heartbeat", heartbeatHandler).Methods("POST")
 
 	// Configure server
 	srv := &http.Server{
