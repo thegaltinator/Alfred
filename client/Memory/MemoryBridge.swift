@@ -1,71 +1,97 @@
 import Foundation
 
-/// MemoryBridge - Simple subprocess bridge to Python memory orchestrator
-/// Replaces the entire Swift memory stack with efficient Python calls
+/// MemoryBridge - Local memory orchestration following arectiure_final.md
+/// Integrates EmbedRunner, SQLiteStore, and VecIndex for on-device memory operations
+/// Architecture compliant: Single Swift process with local embeddings
 public final class MemoryBridge {
 
     // MARK: - Properties
 
-    private let pythonPath: String
-    private let orchestratorPath: String
-    private let session = URLSession.shared
+    private let embedRunner: EmbedRunner
+    private let sqliteStore: SQLiteStore
+    private let vecIndex: VecIndex
+
+    // MARK: - Performance optimization properties
+
+    /// In-memory cache for recent transcript processing to avoid redundant operations
+    private var transcriptCache: [String: MemoryResponse] = [:]
+    private let maxTranscriptCacheSize = 50
+    private let transcriptCacheQueue = DispatchQueue(label: "com.alfred.memorybridge.transcriptCache")
 
     // MARK: - Initialization
 
-    /// Initialize bridge to Python memory orchestrator
-    public init() throws {
-        // Find Python executable
-        self.pythonPath = try Self.findPythonExecutable()
+    /// Initialize bridge with local memory components
+    public init(embedRunner: EmbedRunner? = nil,
+                sqliteStore: SQLiteStore? = nil) throws {
+        let resolvedRunner = try embedRunner ?? EmbedRunner()
+        self.embedRunner = resolvedRunner
 
-        // Path to memory orchestrator module
-        let clientDir = URL(fileURLWithPath: #file)
-            .deletingLastPathComponent()  // Memory/
-            .deletingLastPathComponent()  // client/
-        self.orchestratorPath = clientDir
-            .appendingPathComponent("memory_orchestrator")
-            .path
+        let resolvedStore = try sqliteStore ?? SQLiteStore()
+        self.sqliteStore = resolvedStore
 
-        // Verify orchestrator exists
-        let orchestratorInit = "\(orchestratorPath)/__init__.py"
-        guard FileManager.default.fileExists(atPath: orchestratorInit) else {
-            throw MemoryBridgeError.orchestratorNotFound("Memory orchestrator not found at \(orchestratorPath)")
-        }
+        // Initialize vector index with the SQLite connection
+        self.vecIndex = VecIndex(db: resolvedStore.db)
 
-        print("✅ MemoryBridge: Python -> \(pythonPath)")
-        print("✅ MemoryBridge: Orchestrator -> \(orchestratorPath)")
+        print("✅ MemoryBridge: Local memory system initialized")
+        print("✅ MemoryBridge: EmbedRunner ready -> \(resolvedRunner.ready)")
     }
 
     // MARK: - Public API
 
-    /// Process user transcript and return speech plan with memories
+    /// Process user transcript and return speech plan with memories (optimized)
     /// - Parameter transcript: User's spoken transcript
     /// - Returns: Response with speech plan and retrieved memories
     public func processTranscript(_ transcript: String) async throws -> MemoryResponse {
         let startTime = CFAbsoluteTimeGetCurrent()
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Check cache first to avoid redundant processing
+        if let cached = cachedResponse(for: trimmedTranscript) {
+            print("🎯 MemoryBridge: Cache hit for transcript length \(trimmedTranscript.count)")
+            return cached
+        }
 
         do {
-            let result = try await runPythonCommand(
-                "process",
-                args: [transcript]
+            // Generate embedding for the transcript
+            let queryEmbedding = try await embedRunner.embed(trimmedTranscript)
+
+            // Search for similar memories using vector index
+            let similarMemories = try vecIndex.findSimilarNotes(
+                queryEmbedding: queryEmbedding,
+                limit: 5,
+                threshold: 0.7
             )
 
-            let response = try parseMemoryResponse(result)
+            // Get full memory details (optimized)
+            let retrievedMemories = try await getFullMemoryDetails(for: similarMemories)
+
+            // Generate speech plan (simplified - in full implementation would call Cerebras)
+            let speechPlan = generateSpeechPlan(transcript: trimmedTranscript, memories: retrievedMemories)
 
             let processingTime = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-            return MemoryResponse(
-                speechPlan: response.speech_plan,
-                retrievedMemories: response.retrieved_memories,
+            let response = MemoryResponse(
+                speechPlan: speechPlan,
+                retrievedMemories: retrievedMemories,
                 processingTimeMs: processingTime
             )
+
+            // Cache the response
+            cacheTranscriptResponse(transcript: trimmedTranscript, response: response)
+
+            return response
 
         } catch {
             print("❌ MemoryBridge process failed: \(error)")
             // Return fallback response
-            return MemoryResponse(
-                speechPlan: "I heard you say: \(transcript)",
+            let fallbackResponse = MemoryResponse(
+                speechPlan: "I heard you say: \(trimmedTranscript)",
                 retrievedMemories: [],
                 processingTimeMs: (CFAbsoluteTimeGetCurrent() - startTime) * 1000
             )
+
+            // Cache even fallback responses to avoid repeated failed processing
+            cacheTranscriptResponse(transcript: trimmedTranscript, response: fallbackResponse)
+            return fallbackResponse
         }
     }
 
@@ -76,12 +102,18 @@ public final class MemoryBridge {
     /// - Returns: UUID of the created memory
     public func addMemory(_ content: String, metadata: [String: Any] = [:]) async throws -> String {
         do {
-            let metadataString = try dictToJsonString(metadata)
-            let result = try await runPythonCommand(
-                "add",
-                args: [content, "--metadata", metadataString]
-            )
-            return result.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Generate embedding for the memory
+            let embedding = try await embedRunner.embed(content)
+
+            // Add memory to SQLite store
+            let note = try sqliteStore.addNote(content: content, metadata: serializeMetadata(metadata))
+
+            // Store embedding in vector index
+            try vecIndex.storeEmbedding(noteId: note.id, embedding: embedding)
+
+            print("✅ MemoryBridge: Added memory \(note.uuid)")
+            return note.uuid
+
         } catch {
             print("❌ MemoryBridge addMemory failed: \(error)")
             throw MemoryBridgeError.operationFailed("Failed to add memory: \(error.localizedDescription)")
@@ -95,29 +127,18 @@ public final class MemoryBridge {
     /// - Returns: Array of memory dictionaries with similarity scores
     public func searchMemories(_ query: String, limit: Int = 5) async throws -> [MemoryResult] {
         do {
-            let result = try await runPythonCommand(
-                "search",
-                args: [query, "--limit", String(limit)]
+            // Generate embedding for query
+            let queryEmbedding = try await embedRunner.embed(query)
+
+            // Search vector index
+            let similarMemories = try vecIndex.findSimilarNotes(
+                queryEmbedding: queryEmbedding,
+                limit: limit,
+                threshold: 0.5
             )
 
-            guard let data = result.data(using: .utf8),
-                  let memories = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-                return []
-            }
-
-            return memories.compactMap { memoryDict in
-                guard let content = memoryDict["content"] as? String,
-                      let similarity = memoryDict["similarity"] as? Double else {
-                    return nil
-                }
-
-                return MemoryResult(
-                    content: content,
-                    similarity: similarity,
-                    metadata: memoryDict["metadata"] as? [String: Any] ?? [:],
-                    uuid: memoryDict["uuid"] as? String ?? UUID().uuidString
-                )
-            }
+            // Convert to MemoryResult format
+            return try await getFullMemoryDetails(for: similarMemories)
 
         } catch {
             print("❌ MemoryBridge search failed: \(error)")
@@ -125,117 +146,117 @@ public final class MemoryBridge {
         }
     }
 
+    /// Get memory statistics
+    /// - Returns: Dictionary with memory store statistics
+    public func getMemoryStats() async throws -> [String: Any] {
+        do {
+            let noteCount = try sqliteStore.getNotesCount()
+            return [
+                "total_notes": noteCount,
+                "embedding_dimension": EmbedRunner.embeddingDimension,
+                "model_ready": embedRunner.ready
+            ]
+        } catch {
+            print("❌ MemoryBridge stats failed: \(error)")
+            return [:]
+        }
+    }
+
     // MARK: - Private Methods
 
-    private func runPythonCommand(_ command: String, args: [String]) async throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: pythonPath)
+    /// Get full memory details for vector search results (optimized)
+    private func getFullMemoryDetails(for similarMemories: [(noteId: Int, similarity: Float)]) async throws -> [MemoryResult] {
+        var results: [MemoryResult] = []
 
-        // Build Python command
-        var pythonArgs = [
-            "-m", "memory_orchestrator",
-            command
-        ]
-        pythonArgs.append(contentsOf: args)
-
-        // Set working directory to client directory
-        let clientDir = URL(fileURLWithPath: orchestratorPath).deletingLastPathComponent()
-        process.currentDirectoryURL = clientDir
-
-        process.arguments = pythonArgs
-
-        // Set up environment
-        var environment = ProcessInfo.processInfo.environment
-        environment["PYTHONPATH"] = clientDir.path
-        process.environment = environment
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        // Run process with timeout
-        try process.run()
-
-        let waitResult = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            DispatchQueue.global().async {
-                process.waitUntilExit()
-                if process.terminationStatus == 0 {
-                    continuation.resume()
-                } else {
-                    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                    let stderrOutput = String(data: stderrData, encoding: .utf8) ?? "Unknown error"
-                    continuation.resume(throwing: MemoryBridgeError.processFailed(status: process.terminationStatus, message: stderrOutput))
-                }
+        // Use efficient database lookups instead of loading all notes
+        for memory in similarMemories {
+            // Get specific note by ID - much more efficient
+            if let note = try sqliteStore.getNoteByID(id: memory.noteId) {
+                let metadata = deserializeMetadata(note.metadata)
+                results.append(MemoryResult(
+                    content: note.content,
+                    similarity: memory.similarity,
+                    metadata: metadata,
+                    uuid: note.uuid
+                ))
             }
         }
 
-        // Get output
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: stdoutData, encoding: .utf8) else {
-            throw MemoryBridgeError.outputParsingFailed("Failed to decode Python output")
-        }
-
-        return output
+        return results.sorted { $0.similarity > $1.similarity }
     }
 
-    private func parseMemoryResponse(_ jsonString: String) throws -> MemoryResponseInternal {
-        guard let data = jsonString.data(using: .utf8) else {
-            throw MemoryBridgeError.outputParsingFailed("Invalid UTF-8 output")
+    /// Generate speech plan based on transcript and memories
+    /// In full implementation, this would call Cerebras API
+    private func generateSpeechPlan(transcript: String, memories: [MemoryResult]) -> String {
+        guard !memories.isEmpty else {
+            return "I heard you say: \(transcript)"
         }
 
-        let decoder = JSONDecoder()
-        return try decoder.decode(MemoryResponseInternal.self, from: data)
+        let memorySummary = memories.prefix(2).map { memory in
+            "- \(memory.content.prefix(50))..."
+        }.joined(separator: "\n")
+
+        return """
+        I heard you say: "\(transcript)"
+
+        I found some relevant memories:
+        \(memorySummary)
+
+        How can I help you with this?
+        """
     }
 
-    private func dictToJsonString(_ dict: [String: Any]) throws -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+    /// Serialize metadata dictionary to JSON string
+    private func serializeMetadata(_ metadata: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: metadata),
               let string = String(data: data, encoding: .utf8) else {
-            throw MemoryBridgeError.invalidInput("Cannot convert metadata to JSON")
+            return "{}"
         }
         return string
     }
 
-    private static func findPythonExecutable() throws -> String {
-        // Try common Python executable names
-        let candidates = [
-            "/usr/bin/python3",
-            "/usr/local/bin/python3",
-            "/opt/homebrew/bin/python3",
-            "python3"  // Will search PATH
-        ]
-
-        for candidate in candidates {
-            if candidate.hasPrefix("/") {
-                // Absolute path - check if exists and is executable
-                if FileManager.default.isExecutableFile(atPath: candidate) {
-                    return candidate
-                }
-            } else {
-                // Search in PATH
-                if let whichResult = try? shell("which \(candidate)"),
-                   !whichResult.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return whichResult.trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-            }
+    /// Deserialize metadata JSON string to dictionary
+    private func deserializeMetadata(_ metadata: String?) -> [String: Any] {
+        guard let metadata = metadata,
+              let data = metadata.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
         }
-
-        throw MemoryBridgeError.pythonNotFound("Python3 executable not found")
+        return dict
     }
 
-    private static func shell(_ command: String) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", command]
+    /// Cache transcript processing response
+    private func cacheTranscriptResponse(transcript: String, response: MemoryResponse) {
+        transcriptCacheQueue.sync {
+            // Remove oldest entries if cache is full
+            if self.transcriptCache.count >= self.maxTranscriptCacheSize {
+                let keysToRemove = Array(self.transcriptCache.keys.prefix(self.maxTranscriptCacheSize / 4))
+                for key in keysToRemove {
+                    self.transcriptCache.removeValue(forKey: key)
+                }
+            }
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
+            self.transcriptCache[transcript] = response
+        }
+    }
 
-        try process.run()
-        process.waitUntilExit()
+    /// Clear transcript cache (useful for testing or memory management)
+    public func clearTranscriptCache() {
+        transcriptCacheQueue.sync {
+            self.transcriptCache.removeAll()
+        }
+        print("🧹 MemoryBridge: Cleared transcript cache")
+    }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8) ?? ""
+    /// Delete a stored memory by UUID (used for diagnostics/self-tests)
+    public func deleteMemory(uuid: String) throws {
+        try sqliteStore.deleteNote(uuid: uuid)
+    }
+
+    private func cachedResponse(for transcript: String) -> MemoryResponse? {
+        transcriptCacheQueue.sync {
+            transcriptCache[transcript]
+        }
     }
 }
 
@@ -249,50 +270,29 @@ public struct MemoryResponse {
 
 public struct MemoryResult {
     public let content: String
-    public let similarity: Double
+    public let similarity: Float
     public let metadata: [String: Any]
     public let uuid: String
-}
-
-// Internal response model for JSON parsing
-private struct MemoryResponseInternal: Codable {
-    let speech_plan: String
-    let retrieved_memories: [MemoryResultInternal]
-    let processing_time_ms: Double
-    let error: String?
-
-    private struct MemoryResultInternal: Codable {
-        let content: String
-        let similarity: Double
-        let metadata: [String: String]  // Simplified for JSON
-        let uuid: String?
-    }
 }
 
 // MARK: - Error Types
 
 public enum MemoryBridgeError: Error, LocalizedError {
-    case pythonNotFound(String)
-    case orchestratorNotFound(String)
-    case processFailed(status: Int32, message: String)
-    case outputParsingFailed(String)
-    case invalidInput(String)
+    case initializationFailed(String)
     case operationFailed(String)
+    case embeddingFailed(String)
+    case databaseError(String)
 
     public var errorDescription: String? {
         switch self {
-        case .pythonNotFound(let message):
-            return "Python not found: \(message)"
-        case .orchestratorNotFound(let message):
-            return "Memory orchestrator not found: \(message)"
-        case .processFailed(let status, let message):
-            return "Python process failed with status \(status): \(message)"
-        case .outputParsingFailed(let message):
-            return "Failed to parse Python output: \(message)"
-        case .invalidInput(let message):
-            return "Invalid input: \(message)"
+        case .initializationFailed(let message):
+            return "Initialization failed: \(message)"
         case .operationFailed(let message):
             return "Operation failed: \(message)"
+        case .embeddingFailed(let message):
+            return "Embedding failed: \(message)"
+        case .databaseError(let message):
+            return "Database error: \(message)"
         }
     }
 }

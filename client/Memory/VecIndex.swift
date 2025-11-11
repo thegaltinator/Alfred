@@ -1,36 +1,93 @@
 import Foundation
 import SQLite3
+import CSqliteVec
 
-/// VecIndex - sqlite-vec / sqlite-vss glue for 1024-dim cosine similarity
-/// Provides vector search capabilities for semantic memory recall
-public class VecIndex {
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    // MARK: - Properties
-
-    /// Database connection (shared with SQLiteStore)
+/// VecIndex - sqlite-vec glue for 1024-dim cosine similarity
+public final class VecIndex {
     private let db: OpaquePointer?
-
-    /// Thread safety queue
     private let queue = DispatchQueue(label: "com.alfred.vecindex", qos: .utility)
-
-    /// Vector dimension (1024 for Qwen3-Embedding-0.6B)
     private static let vectorDimension = 1024
+    private static let registrationLock = NSLock()
+    private static var registered = false
 
-    // MARK: - Initialization
-
-    /// Initialize vector index with shared database connection
-    /// - Parameter db: SQLite database connection
     public init(db: OpaquePointer?) {
         self.db = db
-        createVectorTables()
+        registerVecExtension()
+        createTables()
     }
 
-    // MARK: - Table Setup
+    public func storeEmbedding(noteId: Int, embedding: [Float]) throws {
+        guard embedding.count == Self.vectorDimension else {
+            throw VecIndexError.invalidDimension("Expected \(Self.vectorDimension), got \(embedding.count)")
+        }
 
-    /// Create vector tables for embedding storage and search
-    private func createVectorTables() {
+        try queue.sync {
+            try insertBlobEmbedding(noteId: noteId, embedding: embedding)
+            try insertVectorRow(noteId: noteId, embedding: embedding)
+        }
+
+        print("✅ VecIndex: Stored embedding for note \(noteId)")
+    }
+
+    public func findSimilarNotes(queryEmbedding: [Float], limit: Int = 5, threshold: Float = 0.7) throws -> [(noteId: Int, similarity: Float)] {
+        guard queryEmbedding.count == Self.vectorDimension else {
+            throw VecIndexError.invalidDimension("Expected \(Self.vectorDimension), got \(queryEmbedding.count)")
+        }
+
+        return try queue.sync {
+            try searchWithVectorExtension(queryEmbedding: queryEmbedding, limit: limit, threshold: threshold)
+        }
+    }
+
+    public func deleteEmbeddings(noteId: Int) throws {
+        try queue.sync {
+            let deleteBlob = "DELETE FROM embeddings WHERE note_id = ?;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, deleteBlob, -1, &stmt, nil) == SQLITE_OK else {
+                throw VecIndexError.preparationFailed("Failed to prepare embedding delete")
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int(stmt, 1, Int32(noteId))
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                let errorMsg = String(cString: sqlite3_errmsg(db))
+                throw VecIndexError.executionFailed("Embedding delete failed: \(errorMsg)")
+            }
+
+            let deleteVec = "DELETE FROM vec_index WHERE rowid = ?;"
+            var vecStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, deleteVec, -1, &vecStmt, nil) == SQLITE_OK else {
+                throw VecIndexError.preparationFailed("Failed to prepare vec_index delete")
+            }
+            defer { sqlite3_finalize(vecStmt) }
+            sqlite3_bind_int(vecStmt, 1, Int32(noteId))
+            guard sqlite3_step(vecStmt) == SQLITE_DONE else {
+                let errorMsg = String(cString: sqlite3_errmsg(db))
+                throw VecIndexError.executionFailed("vec_index delete failed: \(errorMsg)")
+            }
+        }
+
+        print("✅ VecIndex: Deleted embeddings for note \(noteId)")
+    }
+
+    // MARK: - Private helpers
+
+    private func registerVecExtension() {
+        Self.registrationLock.lock()
+        defer { Self.registrationLock.unlock() }
+        guard !Self.registered else { return }
+        guard let db else { fatalError("VecIndex: missing database handle for sqlite-vec registration") }
+        let rc = sqlite_vec_register(db)
+        guard rc == SQLITE_OK else {
+            fatalError("VecIndex: sqlite-vec registration failed (rc \(rc))")
+        }
+        Self.registered = true
+        print("✅ VecIndex: sqlite-vec extension registered")
+    }
+
+    private func createTables() {
         do {
-            // Create embeddings table with vector columns
             let createEmbeddingsTable = """
             CREATE TABLE IF NOT EXISTS embeddings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,195 +102,110 @@ public class VecIndex {
 
             try executeSQL(createEmbeddingsTable)
 
-            // Initialize sqlite-vec extension (placeholder for C-04)
-            // In full implementation, this would load the sqlite-vec extension
-            print("✅ VecIndex: Vector tables created/verified")
-
-        } catch {
-            print("❌ VecIndex: Failed to create vector tables: \(error.localizedDescription)")
-        }
-    }
-
-    // MARK: - Vector Operations
-
-    /// Store embedding vector for a note
-    /// - Parameters:
-    ///   - noteId: ID of the note
-    ///   - embedding: 1024-dimensional embedding vector as [Float]
-    public func storeEmbedding(noteId: Int, embedding: [Float]) throws {
-        guard embedding.count == Self.vectorDimension else {
-            throw VecIndexError.invalidDimension("Expected \(Self.vectorDimension), got \(embedding.count)")
-        }
-
-        try queue.sync {
-            // Convert Float array to Data (blob representation)
-            let data = embedding.withUnsafeBufferPointer { buffer in
-                Data(buffer: buffer)
-            }
-
-            let sql = """
-            INSERT OR REPLACE INTO embeddings (note_id, embedding)
-            VALUES (?, ?);
-            """
-
-            var stmt: OpaquePointer?
-            let prepareResult = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-
-            guard prepareResult == SQLITE_OK else {
-                throw VecIndexError.preparationFailed("Failed to prepare embedding insert")
-            }
-
-            defer { sqlite3_finalize(stmt) }
-
-            sqlite3_bind_int(stmt, 1, Int32(noteId))
-            data.withUnsafeBytes { bytes in
-                if let baseAddress = bytes.baseAddress {
-                    sqlite3_bind_blob(stmt, 2, baseAddress, Int32(data.count), nil)
-                }
-            }
-
-            let stepResult = sqlite3_step(stmt)
-            guard stepResult == SQLITE_DONE else {
-                let errorMsg = String(cString: sqlite3_errmsg(db))
-                throw VecIndexError.executionFailed("Embedding insert failed: \(errorMsg)")
-            }
-        }
-
-        print("✅ VecIndex: Stored embedding for note \(noteId)")
-    }
-
-    /// Find similar notes using cosine similarity
-    /// - Parameters:
-    ///   - queryEmbedding: Query embedding vector
-    ///   - limit: Maximum number of results to return
-    ///   - threshold: Minimum similarity threshold (0.0 to 1.0)
-    /// - Returns: Array of similar note IDs with similarity scores
-    public func findSimilarNotes(queryEmbedding: [Float], limit: Int = 5, threshold: Float = 0.7) throws -> [(noteId: Int, similarity: Float)] {
-        guard queryEmbedding.count == Self.vectorDimension else {
-            throw VecIndexError.invalidDimension("Expected \(Self.vectorDimension), got \(queryEmbedding.count)")
-        }
-
-        return try queue.sync {
-            // For C-04, implement basic cosine similarity calculation
-            // In full implementation, this would use sqlite-vec for efficient vector search
-
-            let sql = """
-            SELECT note_id, embedding FROM embeddings
-            WHERE note_id IN (
-                SELECT id FROM notes WHERE is_deleted = 0
+            let createVecTable = """
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
+                embedding float[\(Self.vectorDimension)] distance_metric=cosine
             );
             """
 
-            var stmt: OpaquePointer?
-            let prepareResult = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-
-            guard prepareResult == SQLITE_OK else {
-                throw VecIndexError.preparationFailed("Failed to prepare similarity search")
-            }
-
-            defer { sqlite3_finalize(stmt) }
-
-            var results: [(noteId: Int, similarity: Float)] = []
-
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let noteId = Int(sqlite3_column_int(stmt, 0))
-
-                // Extract embedding blob
-                guard let blobPointer = sqlite3_column_blob(stmt, 1) else {
-                    continue
-                }
-                let blobSize = Int(sqlite3_column_bytes(stmt, 1))
-                guard blobSize == MemoryLayout<Float>.size * Self.vectorDimension else {
-                    continue
-                }
-
-                // Convert blob to Float array
-                let data = Data(bytes: blobPointer, count: blobSize)
-                let storedEmbedding = data.withUnsafeBytes { buffer -> [Float] in
-                    let floatBuffer = buffer.bindMemory(to: Float.self)
-                    return Array(floatBuffer)
-                }
-
-                // Calculate cosine similarity
-                let similarity = cosineSimilarity(queryEmbedding, storedEmbedding)
-
-                if similarity >= threshold {
-                    results.append((noteId: noteId, similarity: similarity))
-                }
-            }
-
-            // Sort by similarity (descending) and limit results
-            results.sort { $0.similarity > $1.similarity }
-            return Array(results.prefix(limit))
+            try executeSQL(createVecTable)
+            print("✅ VecIndex: Vector tables created/verified")
+        } catch {
+            fatalError("❌ VecIndex: Failed to create vector tables: \(error.localizedDescription)")
         }
     }
 
-    /// Calculate cosine similarity between two vectors
-    /// - Parameters:
-    ///   - vecA: First vector
-    ///   - vecB: Second vector
-    /// - Returns: Cosine similarity score (-1.0 to 1.0)
-    private func cosineSimilarity(_ vecA: [Float], _ vecB: [Float]) -> Float {
-        guard vecA.count == vecB.count else { return 0.0 }
-
-        var dotProduct: Float = 0.0
-        var normA: Float = 0.0
-        var normB: Float = 0.0
-
-        for i in 0..<vecA.count {
-            dotProduct += vecA[i] * vecB[i]
-            normA += vecA[i] * vecA[i]
-            normB += vecB[i] * vecB[i]
+    private func insertBlobEmbedding(noteId: Int, embedding: [Float]) throws {
+        guard let db else { throw VecIndexError.executionFailed("Database unavailable") }
+        let data = embedding.withUnsafeBufferPointer { Data(buffer: $0) }
+        let sql = "INSERT OR REPLACE INTO embeddings (note_id, embedding) VALUES (?, ?);"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw VecIndexError.preparationFailed("Failed to prepare embedding insert")
         }
-
-        guard normA > 0 && normB > 0 else { return 0.0 }
-
-        return dotProduct / (sqrt(normA) * sqrt(normB))
-    }
-
-    /// Delete embeddings for a note
-    /// - Parameter noteId: ID of the note
-    public func deleteEmbeddings(noteId: Int) throws {
-        try queue.sync {
-            let sql = "DELETE FROM embeddings WHERE note_id = ?;"
-
-            var stmt: OpaquePointer?
-            let prepareResult = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-
-            guard prepareResult == SQLITE_OK else {
-                throw VecIndexError.preparationFailed("Failed to prepare embedding delete")
-            }
-
-            defer { sqlite3_finalize(stmt) }
-
-            sqlite3_bind_int(stmt, 1, Int32(noteId))
-
-            let stepResult = sqlite3_step(stmt)
-            guard stepResult == SQLITE_DONE else {
-                let errorMsg = String(cString: sqlite3_errmsg(db))
-                throw VecIndexError.executionFailed("Embedding delete failed: \(errorMsg)")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int(stmt, 1, Int32(noteId))
+        data.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                sqlite3_bind_blob(stmt, 2, baseAddress, Int32(data.count), nil)
             }
         }
-
-        print("✅ VecIndex: Deleted embeddings for note \(noteId)")
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            let errorMsg = String(cString: sqlite3_errmsg(db))
+            throw VecIndexError.executionFailed("Embedding insert failed: \(errorMsg)")
+        }
     }
 
-    // MARK: - Database Operations
+    private func insertVectorRow(noteId: Int, embedding: [Float]) throws {
+        guard let db else { throw VecIndexError.executionFailed("Database unavailable") }
+        let sql = "INSERT OR REPLACE INTO vec_index(rowid, embedding) VALUES (?, ?);"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw VecIndexError.preparationFailed("Failed to prepare vec_index insert")
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int(stmt, 1, Int32(noteId))
+        let json = try jsonString(for: embedding)
+        sqlite3_bind_text(stmt, 2, json, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            let errorMsg = String(cString: sqlite3_errmsg(db))
+            throw VecIndexError.executionFailed("vec_index insert failed: \(errorMsg)")
+        }
+    }
 
-    /// Execute SQL statement with error handling
+    private func searchWithVectorExtension(queryEmbedding: [Float], limit: Int, threshold: Float) throws -> [(noteId: Int, similarity: Float)] {
+        guard let db else { throw VecIndexError.executionFailed("Database unavailable") }
+        let json = try jsonString(for: queryEmbedding)
+        let sql = """
+        SELECT rowid, distance
+        FROM vec_index
+        WHERE embedding MATCH ?
+        ORDER BY distance
+        LIMIT ?;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw VecIndexError.preparationFailed("Failed to prepare vec search")
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, json, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 2, Int32(limit))
+
+        var results: [(Int, Float)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let noteId = Int(sqlite3_column_int(stmt, 0))
+            let distance = sqlite3_column_double(stmt, 1)
+            let similarity = max(0, 1 - Float(distance))
+            if similarity >= threshold {
+                results.append((noteId, similarity))
+            }
+        }
+
+        return results
+    }
+
     private func executeSQL(_ sql: String) throws {
+        guard let db else { throw VecIndexError.executionFailed("Database unavailable") }
         var errMsg: UnsafeMutablePointer<Int8>?
         let result = sqlite3_exec(db, sql, nil, nil, &errMsg)
-
         if result != SQLITE_OK {
             let errorMsg = errMsg != nil ? String(cString: errMsg!) : "Unknown SQL error"
             sqlite3_free(errMsg)
             throw VecIndexError.executionFailed(errorMsg)
         }
     }
-}
 
-// MARK: - Error Types
+    private func jsonString(for embedding: [Float]) throws -> String {
+        let doubles = embedding.map { Double($0) }
+        let data = try JSONSerialization.data(withJSONObject: doubles)
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw VecIndexError.executionFailed("Failed to encode embedding JSON")
+        }
+        return json
+    }
+}
 
 public enum VecIndexError: Error, LocalizedError {
     case invalidDimension(String)

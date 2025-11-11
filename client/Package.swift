@@ -13,10 +13,6 @@ let package = Package(
             name: "AlfredClient",
             targets: ["AlfredClient"]
         ),
-        .executable(
-            name: "TestMemory",
-            targets: ["TestMemory"]
-        ),
     ],
     targets: [
         .executableTarget(
@@ -41,18 +37,35 @@ let package = Package(
         ),
         .target(
             name: "Bridge",
-            dependencies: ["Memory"],
+            dependencies: ["Memory", "TTS"],
             path: "Bridge"
         ),
         .target(
             name: "Memory",
-            dependencies: [],
-            path: "Memory"
+            dependencies: ["CLlama", "CSqliteVec"],
+            path: "Memory",
+            exclude: ["CLlama", "CSqliteVec"],
+            linkerSettings: [
+                .linkedFramework("CoreML", .when(platforms: [.macOS])),
+                .linkedFramework("Accelerate", .when(platforms: [.macOS])),
+                .linkedLibrary("sqlite3", .when(platforms: [.macOS]))
+            ]
         ),
-          .executableTarget(
-            name: "TestMemory",
-            dependencies: ["Memory"],
-            path: "TestMemory"
+        .target(
+            name: "CSqliteVec",
+            dependencies: [],
+            path: "Memory/CSqliteVec",
+            publicHeadersPath: ".",
+            cSettings: [
+                .define("SQLITE_CORE"),
+                .define("SQLITE_VEC_ENABLE_NEON")
+            ]
+        ),
+        .target(
+            name: "CLlama",
+            dependencies: [],
+            path: "Memory/CLlama",
+            publicHeadersPath: "."
         ),
         .testTarget(
             name: "MemoryTests",

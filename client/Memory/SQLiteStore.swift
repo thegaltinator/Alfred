@@ -8,7 +8,7 @@ public class SQLiteStore {
     // MARK: - Properties
 
     /// Database connection handle
-    private var db: OpaquePointer?
+    private(set) var db: OpaquePointer?
 
     /// Database file URL
     private let dbURL: URL

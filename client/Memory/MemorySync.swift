@@ -2,7 +2,7 @@ import Foundation
 
 /// MemorySync - Local→cloud push on change; periodic reconcile
 /// Handles two-way synchronization between local SQLite memory and cloud mirror
-public class MemorySync {
+public final class MemorySync: @unchecked Sendable {
 
     // MARK: - Properties
 
