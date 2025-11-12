@@ -2,6 +2,7 @@ import Cocoa
 import SwiftUI
 import Bridge
 import Heartbeat
+import Memory
 
 let app = NSApplication.shared
 let delegate = StatusBar()
@@ -13,6 +14,7 @@ class StatusBar: NSObject, NSApplicationDelegate {
     var popover: NSPopover!
     private var heartbeatClient: Heartbeat.HeartbeatClient?
     private var backendPopover: NSPopover?
+    private var memoryPopover: NSPopover?
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         print("✅ Alfred menubar app starting")
@@ -44,6 +46,10 @@ class StatusBar: NSObject, NSApplicationDelegate {
         let backendItem = NSMenuItem(title: "Test Backend", action: #selector(openBackendTest(_:)), keyEquivalent: "")
         backendItem.target = self
         menu.addItem(backendItem)
+
+        let addNoteItem = NSMenuItem(title: "Add Note…", action: #selector(openAddNote(_:)), keyEquivalent: "")
+        addNoteItem.target = self
+        menu.addItem(addNoteItem)
 
         let testHeartbeatItem = NSMenuItem(title: "Test Heartbeat", action: #selector(testHeartbeat(_:)), keyEquivalent: "")
         testHeartbeatItem.target = self
@@ -82,6 +88,22 @@ class StatusBar: NSObject, NSApplicationDelegate {
         backendPopover?.contentViewController = NSHostingController(rootView: BackendTestView())
 
         if let button = statusBarItem.button, let pop = backendPopover {
+            pop.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    @objc private func openAddNote(_ sender: AnyObject?) {
+        if memoryPopover == nil {
+            let popover = NSPopover()
+            popover.behavior = .semitransient
+            popover.contentSize = NSSize(width: 320, height: 240)
+            memoryPopover = popover
+        }
+
+        memoryPopover?.contentViewController = NSHostingController(rootView: AddNoteView())
+
+        if let button = statusBarItem.button, let pop = memoryPopover {
             pop.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -135,6 +157,10 @@ struct BackendTestView: View {
                 }
             }
 
+            Divider()
+
+            MemoryNoteForm(title: "Memory (SQLite)")
+
             Spacer()
         }
         .padding()
@@ -163,6 +189,70 @@ struct BackendTestView: View {
                 await MainActor.run {
                     self.response = "❌ \(error.localizedDescription)"
                     self.isWaiting = false
+                }
+            }
+        }
+    }
+}
+
+struct AddNoteView: View {
+    var body: some View {
+        MemoryNoteForm(title: "Add Note")
+            .padding()
+            .frame(width: 320, height: 220)
+    }
+}
+
+struct MemoryNoteForm: View {
+    let title: String
+    @State private var noteText = ""
+    @State private var noteStatus = "No notes saved yet."
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline)
+
+            TextEditor(text: $noteText)
+                .frame(minHeight: 60, maxHeight: 80)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                )
+
+            HStack {
+                Spacer()
+                Button("Add Note") {
+                    addNote()
+                }
+                .disabled(noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            Text(noteStatus)
+                .font(.caption)
+                .foregroundStyle(noteStatus.hasPrefix("❌") ? Color.red : Color.secondary)
+        }
+    }
+
+    private func addNote() {
+        let trimmed = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            noteStatus = "Enter a note before saving."
+            return
+        }
+
+        noteStatus = "Saving…"
+        Task {
+            do {
+                let noteID = try SQLiteStore.shared.addNote(content: trimmed)
+                let total = try SQLiteStore.shared.noteCount()
+                await MainActor.run {
+                    self.noteText = ""
+                    self.noteStatus = "✅ Saved note #\(noteID). Total notes: \(total)."
+                }
+            } catch {
+                await MainActor.run {
+                    self.noteStatus = "❌ \(error.localizedDescription)"
                 }
             }
         }

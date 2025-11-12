@@ -17,7 +17,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "AlfredClient",
-            dependencies: ["Bridge", "Heartbeat", "TTS", "AudioIO"],
+            dependencies: ["Bridge", "Heartbeat", "TTS", "AudioIO", "Memory"],
             path: "AppKitUI"
         ),
         .target(
@@ -37,40 +37,16 @@ let package = Package(
         ),
         .target(
             name: "Bridge",
-            dependencies: ["Memory", "TTS"],
+            dependencies: ["TTS"],
             path: "Bridge"
         ),
         .target(
             name: "Memory",
-            dependencies: ["CLlama", "CSqliteVec"],
+            dependencies: [],
             path: "Memory",
-            exclude: ["CLlama", "CSqliteVec"],
             linkerSettings: [
-                .linkedFramework("CoreML", .when(platforms: [.macOS])),
-                .linkedFramework("Accelerate", .when(platforms: [.macOS])),
-                .linkedLibrary("sqlite3", .when(platforms: [.macOS]))
+                .linkedLibrary("sqlite3")
             ]
-        ),
-        .target(
-            name: "CSqliteVec",
-            dependencies: [],
-            path: "Memory/CSqliteVec",
-            publicHeadersPath: ".",
-            cSettings: [
-                .define("SQLITE_CORE"),
-                .define("SQLITE_VEC_ENABLE_NEON")
-            ]
-        ),
-        .target(
-            name: "CLlama",
-            dependencies: [],
-            path: "Memory/CLlama",
-            publicHeadersPath: "."
-        ),
-        .testTarget(
-            name: "MemoryTests",
-            dependencies: ["Memory"],
-            path: "Tests/MemoryTests"
-        ),
+        )
     ]
 )

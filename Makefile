@@ -15,7 +15,7 @@ client-dev:
 		echo "❌ Xcode project not found. Run 'make client-setup' first."; \
 		exit 1; \
 	fi
-	@cd client && xcodebuild -project Alfred.xcodeproj -scheme Alfred -configuration Debug run
+	@/bin/bash -c 'set -a; [ -f client/.env ] && source client/.env; set +a; cd client && xcodebuild -project Alfred.xcodeproj -scheme Alfred -configuration Debug run'
 
 # Cloud development (Go server)
 cloud-dev:
