@@ -98,3 +98,63 @@ func verifyStreamOps(ctx context.Context, client *redis.Client) error {
 
 	return nil
 }
+
+// StreamsHelper provides helper methods for working with Redis streams
+type StreamsHelper struct {
+	client *redis.Client
+}
+
+// NewStreamsHelper creates a new streams helper
+func NewStreamsHelper(client *redis.Client) *StreamsHelper {
+	return &StreamsHelper{
+		client: client,
+	}
+}
+
+// AppendToStream appends data to a Redis stream
+func (sh *StreamsHelper) AppendToStream(ctx context.Context, streamKey string, data map[string]interface{}) (string, error) {
+	return sh.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: streamKey,
+		Values: data,
+	}).Result()
+}
+
+// ReadFromStream reads from a Redis stream
+func (sh *StreamsHelper) ReadFromStream(ctx context.Context, streamKey string, lastID string, count int64) ([]redis.XStream, error) {
+	return sh.client.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{streamKey, lastID},
+		Count:   count,
+		Block:   time.Second,
+	}).Result()
+}
+
+// ReadFromGroup reads from a consumer group in a Redis stream
+func (sh *StreamsHelper) ReadFromGroup(ctx context.Context, streamKey, group, consumer string, count int64) ([]redis.XStream, error) {
+	return sh.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: consumer,
+		Streams:  []string{streamKey, ">"},
+		Count:    count,
+		Block:    time.Second,
+	}).Result()
+}
+
+// CreateConsumerGroup creates a consumer group for a stream
+func (sh *StreamsHelper) CreateConsumerGroup(ctx context.Context, streamKey, group string) error {
+	return sh.client.XGroupCreateMkStream(ctx, streamKey, group, "$").Err()
+}
+
+// AcknowledgeMessage acknowledges a message in a consumer group
+func (sh *StreamsHelper) AcknowledgeMessage(ctx context.Context, streamKey, group string, messageIDs ...string) (int64, error) {
+	return sh.client.XAck(ctx, streamKey, group, messageIDs...).Result()
+}
+
+// GetStreamLength returns the length of a stream
+func (sh *StreamsHelper) GetStreamLength(ctx context.Context, streamKey string) (int64, error) {
+	return sh.client.XLen(ctx, streamKey).Result()
+}
+
+// TrimStream trims a stream to a maximum length
+func (sh *StreamsHelper) TrimStream(ctx context.Context, streamKey string, maxLength int64) error {
+	return sh.client.XTrimMaxLen(ctx, streamKey, maxLength).Err()
+}
