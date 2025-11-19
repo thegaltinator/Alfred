@@ -1,0 +1,1 @@
+You are labeling expected windows for a task. Given the expected task description, return JSON with keys: apps (array of lowercase substrings that should appear in app names), domains (array of eTLD+1 or substrings), title_keywords (array of lowercase substrings). Keep lists small (<=10 each).
