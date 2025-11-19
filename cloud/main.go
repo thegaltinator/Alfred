@@ -15,6 +15,7 @@ import (
 	"alfred-cloud/streams"
 	"alfred-cloud/subagents/calendar_planner"
 	"alfred-cloud/subagents/email_triage"
+	"alfred-cloud/subagents/productivity"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
@@ -60,8 +61,30 @@ func main() {
 	// Initialize streams helper
 	streamsHelper := streams.NewStreamsHelper(redisClient)
 
+	// Initialize productivity heuristic store (used by calendar events for expected apps)
+	prodHeuristicStore := productivity.NewHeuristicStore(redisClient)
+	prodHeuristicService, err := productivity.NewHeuristicService(prodHeuristicStore, nil)
+	if err != nil {
+		log.Fatalf("Failed to init productivity heuristic service: %v", err)
+	}
+
 	// Initialize Calendar Webhook Handler
-	calendarWebhookHandler := NewCalendarWebhookHandler(redisClient, calendarTokenStore, streamsHelper)
+	calendarWebhookHandler := NewCalendarWebhookHandler(redisClient, calendarTokenStore, streamsHelper, prodHeuristicService)
+
+	// Calendar webhook renewal
+	renewEnabled := strings.ToLower(strings.TrimSpace(os.Getenv("CALENDAR_WEBHOOK_RENEW_ENABLED"))) != "false"
+	renewInterval := parseDurationOrDefault(os.Getenv("CALENDAR_WEBHOOK_RENEW_INTERVAL"), time.Hour)
+	renewThreshold := parseDurationOrDefault(os.Getenv("CALENDAR_WEBHOOK_RENEW_THRESHOLD"), 12*time.Hour)
+	renewer := NewWebhookRenewer(redisClient, calendarTokenStore, renewInterval, renewThreshold, renewEnabled)
+	renewer.Start(ctx)
+
+	// Calendar pull sync fallback
+	pullEnabled := strings.ToLower(strings.TrimSpace(os.Getenv("CALENDAR_PULL_SYNC_ENABLED"))) != "false"
+	pullInterval := parseDurationOrDefault(os.Getenv("CALENDAR_PULL_SYNC_INTERVAL"), 3*time.Minute)
+	pullLookback := parseDurationOrDefault(os.Getenv("CALENDAR_PULL_SYNC_LOOKBACK"), 48*time.Hour)
+	pullUsers := parseUserList("CALENDAR_PULL_SYNC_USERS", "test-user")
+	pullSync := NewCalendarPullSync(redisClient, calendarTokenStore, streamsHelper, prodHeuristicService, pullUsers, pullInterval, pullLookback, pullEnabled)
+	pullSync.Start(ctx)
 
 	// Initialize Email Poller
 	var emailPoller *email_triage.EmailPoller
@@ -78,6 +101,25 @@ func main() {
 		} else {
 			log.Println("Email poller disabled: EMAIL_POLLER_USERS empty")
 		}
+	}
+
+	// Initialize Productivity Subagent (Consumer)
+	var productivityConsumer *productivity.ProductivityConsumer
+	prodUsers := parseUserList("PRODUCTIVITY_USERS", "test-user")
+	if len(prodUsers) > 0 {
+		prodClassifier, err := productivity.NewClassifier(prodHeuristicService)
+		if err != nil {
+			log.Fatalf("Failed to init productivity classifier: %v", err)
+		}
+		
+		productivityConsumer = productivity.NewProductivityConsumer(redisClient, prodClassifier, prodHeuristicService, prodUsers)
+		go func() {
+			if err := productivityConsumer.Start(ctx); err != nil {
+				log.Printf("Failed to start productivity consumer: %v", err)
+			}
+		}()
+	} else {
+		log.Println("Productivity consumer disabled: PRODUCTIVITY_USERS empty")
 	}
 
 	// Initialize shadow calendar service (planner subagent)
@@ -113,6 +155,8 @@ func main() {
 
 	// Calendar webhook endpoints
 	calendarWebhookHandler.RegisterRoutes(r)
+	registerProdDebugRoutes(r, prodHeuristicService)
+	registerProdHeuristicRoutes(r, streamsHelper)
 
 	// Calendar manager tool endpoints
 	registerCalendarManagerRoutes(r)
@@ -150,6 +194,11 @@ func main() {
 	// Stop email poller
 	if emailPoller != nil {
 		emailPoller.Stop()
+	}
+	
+	// Stop productivity consumer
+	if productivityConsumer != nil {
+		productivityConsumer.Stop()
 	}
 
 	// Shutdown server
@@ -256,6 +305,17 @@ func parseUserList(envKey, defaultValue string) []string {
 		result = append(result, trimmed)
 	}
 	return result
+}
+
+func parseDurationOrDefault(raw string, def time.Duration) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		return d
+	}
+	return def
 }
 
 // Initialize Google Auth with environment variables for main server

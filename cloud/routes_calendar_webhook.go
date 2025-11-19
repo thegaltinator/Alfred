@@ -7,11 +7,13 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"alfred-cloud/security"
 	"alfred-cloud/streams"
 	"alfred-cloud/subagents/calendar_planner"
+	"alfred-cloud/subagents/productivity"
 	"github.com/gorilla/mux"
 	"github.com/redis/go-redis/v9"
 	calendar "google.golang.org/api/calendar/v3"
@@ -26,14 +28,16 @@ type CalendarWebhookHandler struct {
 	tokenStore       *security.TokenStore
 	webhookRegistrar *calendar_planner.WebhookRegistrar
 	streamsHelper    *streams.StreamsHelper
+	heuristicService *productivity.HeuristicService
 }
 
 // NewCalendarWebhookHandler creates a new calendar webhook handler
-func NewCalendarWebhookHandler(redisClient *redis.Client, tokenStore *security.TokenStore, streamsHelper *streams.StreamsHelper) *CalendarWebhookHandler {
+func NewCalendarWebhookHandler(redisClient *redis.Client, tokenStore *security.TokenStore, streamsHelper *streams.StreamsHelper, heuristicService *productivity.HeuristicService) *CalendarWebhookHandler {
 	return &CalendarWebhookHandler{
-		redisClient:   redisClient,
-		tokenStore:    tokenStore,
-		streamsHelper: streamsHelper,
+		redisClient:      redisClient,
+		tokenStore:       tokenStore,
+		streamsHelper:    streamsHelper,
+		heuristicService: heuristicService,
 	}
 }
 
@@ -43,6 +47,7 @@ func (h *CalendarWebhookHandler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/calendar/webhook/notification", h.handleWebhookNotification).Methods("POST")
 	r.HandleFunc("/calendar/webhook/unregister", h.handleUnregisterWebhook).Methods("POST")
 	r.HandleFunc("/calendar/webhook/status", h.handleWebhookStatus).Methods("GET")
+	r.HandleFunc("/calendar/webhook/manual_sync", h.handleManualSync).Methods("POST")
 }
 
 // WebhookRegistrationRequest represents a request to register a webhook
@@ -223,8 +228,55 @@ func (h *CalendarWebhookHandler) handleWebhookNotification(w http.ResponseWriter
 	}
 
 	if len(changes) == 0 {
-		w.WriteHeader(http.StatusOK)
-		return
+		log.Printf("Calendar webhook: no deltas for user=%s calendar=%s; forcing full fetch window", userID, calendarID)
+		googleClient := security.NewGoogleServiceClient(h.tokenStore)
+		calendarService, err := googleClient.GetCalendarService(ctx, userID)
+		if err != nil {
+			log.Printf("Warning: fallback calendar service failed for user %s: %v", userID, err)
+		}
+		recent, err := h.fetchRecentEvents(ctx, calendarService, calendarID, time.Now().Add(-24*time.Hour))
+		if err != nil {
+			log.Printf("Warning: recent fallback failed for user %s: %v", userID, err)
+		} else if len(recent) > 0 {
+			changes = append(changes, recent...)
+			log.Printf("Calendar webhook: fallback captured %d events for user=%s calendar=%s", len(recent), userID, calendarID)
+		}
+		if len(changes) == 0 {
+			log.Printf("Calendar webhook: still no changes; enqueueing minimal marker for user=%s calendar=%s", userID, calendarID)
+			changes = append(changes, map[string]interface{}{
+				"type":              "calendar_delta",
+				"user_id":           userID,
+				"calendar_id":       calendarID,
+				"resource_state":    "exists",
+				"resource_uri":      resourceURI,
+				"channel_id":        channelID,
+				"resource_id":       resourceID,
+				"notified_at":       time.Now().UTC().Format(time.RFC3339Nano),
+				"change_type":       "noop",
+				"event_summary":     "noop",
+				"event_id":          "",
+				"event_description": "",
+			})
+		}
+	}
+
+	if h.heuristicService != nil {
+		for _, changeData := range changes {
+			if fmt.Sprint(changeData["change_type"]) == "deleted" {
+				continue
+			}
+			payload, err := h.buildHeuristicPayload(changeData, userID)
+			if err != nil {
+				log.Printf("Warning: skipping heuristic for event %v: %v", changeData["event_id"], err)
+				continue
+			}
+			log.Printf("Prod heuristic: generating expected apps for user=%s event=%s title=%q", userID, payload.EventID, payload.Title)
+			if stored, err := h.heuristicService.UpsertEventHeuristic(ctx, payload); err != nil {
+				log.Printf("Warning: failed to persist productivity heuristic for event %s: %v", payload.EventID, err)
+			} else {
+				log.Printf("Prod heuristic: stored event=%s apps=%v start=%s end=%s", stored.EventID, stored.ExpectedApps, stored.StartTime, stored.EndTime)
+			}
+		}
 	}
 
 	// Store the calendar change notification in the input stream
@@ -236,6 +288,8 @@ func (h *CalendarWebhookHandler) handleWebhookNotification(w http.ResponseWriter
 			changeData["resource_state"] = resourceState
 			changeData["resource_uri"] = resourceURI
 			changeData["notified_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+			changeData["user_id"] = userID
+			changeData["calendar_id"] = calendarID
 
 			if _, err := h.streamsHelper.AppendToStream(ctx, inputKey, changeData); err != nil {
 				log.Printf("Warning: Failed to store calendar change in stream: %v", err)
@@ -543,6 +597,106 @@ func (h *CalendarWebhookHandler) fetchChangedEvents(ctx context.Context, calenda
 	return events, nextToken, nil
 }
 
+func (h *CalendarWebhookHandler) fetchRecentEvents(ctx context.Context, calendarService *calendar.Service, calendarID string, since time.Time) ([]map[string]interface{}, error) {
+	call := calendarService.Events.List(calendarID).
+		ShowDeleted(true).
+		SingleEvents(true).
+		TimeMin(since.Format(time.RFC3339)).
+		TimeMax(time.Now().Add(48 * time.Hour).Format(time.RFC3339))
+
+	resp, err := call.Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("fetch recent events failed: %w", err)
+	}
+
+	changes := make([]map[string]interface{}, 0, len(resp.Items))
+	for _, event := range resp.Items {
+		changes = append(changes, normalizeEventChange(event, "", calendarID))
+	}
+	return changes, nil
+}
+
+// handleManualSync pulls recent events and pushes them through the same pipeline as webhook notifications.
+func (h *CalendarWebhookHandler) handleManualSync(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var req struct {
+		UserID     string `json:"user_id"`
+		CalendarID string `json:"calendar_id,omitempty"`
+		LookbackH  int    `json:"lookback_hours,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.UserID == "" {
+		http.Error(w, "user_id required", http.StatusBadRequest)
+		return
+	}
+	if req.CalendarID == "" {
+		req.CalendarID = "primary"
+	}
+	lookback := time.Duration(req.LookbackH) * time.Hour
+	if lookback <= 0 {
+		lookback = 24 * time.Hour
+	}
+
+	googleClient := security.NewGoogleServiceClient(h.tokenStore)
+	calendarService, err := googleClient.GetCalendarService(ctx, req.UserID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get calendar service: %v", err), http.StatusUnauthorized)
+		return
+	}
+
+	events, err := h.fetchRecentEvents(ctx, calendarService, req.CalendarID, time.Now().Add(-lookback))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to fetch events: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if h.streamsHelper != nil {
+		inputKey := fmt.Sprintf("user:%s:in:calendar", req.UserID)
+		for _, changeData := range events {
+			changeData["channel_id"] = "manual-sync"
+			changeData["resource_state"] = "exists"
+			changeData["resource_uri"] = fmt.Sprint(changeData["resource_uri"])
+			changeData["notified_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+			changeData["user_id"] = req.UserID
+			changeData["calendar_id"] = req.CalendarID
+
+			if _, err := h.streamsHelper.AppendToStream(ctx, inputKey, changeData); err != nil {
+				log.Printf("Manual sync: failed to store calendar change: %v", err)
+			}
+		}
+	}
+
+	if h.heuristicService != nil {
+		for _, changeData := range events {
+			if fmt.Sprint(changeData["change_type"]) == "deleted" {
+				continue
+			}
+			payload, err := h.buildHeuristicPayload(changeData, req.UserID)
+			if err != nil {
+				log.Printf("Manual sync: skipping heuristic for event %v: %v", changeData["event_id"], err)
+				continue
+			}
+			log.Printf("Manual sync: heuristic generate user=%s event=%s title=%q", req.UserID, payload.EventID, payload.Title)
+			if stored, err := h.heuristicService.UpsertEventHeuristic(ctx, payload); err != nil {
+				log.Printf("Manual sync: heuristic persist failed for event %s: %v", payload.EventID, err)
+			} else {
+				log.Printf("Manual sync: stored heuristic event=%s apps=%v", stored.EventID, stored.ExpectedApps)
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"user_id":  req.UserID,
+		"calendar": req.CalendarID,
+		"count":    len(events),
+		"status":   "synced",
+	})
+}
+
 func (h *CalendarWebhookHandler) storeSyncToken(ctx context.Context, userID, calendarID, token string) error {
 	return h.redisClient.Set(ctx, h.syncTokenKey(userID, calendarID), token, 0).Err()
 }
@@ -599,6 +753,38 @@ func normalizeEventChange(event *calendar.Event, userID, calendarID string) map[
 	}
 }
 
+func (h *CalendarWebhookHandler) buildHeuristicPayload(change map[string]interface{}, userID string) (productivity.EventPayload, error) {
+	payload := productivity.EventPayload{
+		UserID:      userID,
+		EventID:     fmt.Sprint(change["event_id"]),
+		Title:       fmt.Sprint(change["event_summary"]),
+		Description: fmt.Sprint(change["event_description"]),
+	}
+	if payload.EventID == "" {
+		return payload, fmt.Errorf("event_id missing")
+	}
+
+	start, err := parseEventTimestamp(fmt.Sprint(change["start_time"]))
+	if err != nil {
+		return payload, fmt.Errorf("invalid start_time: %w", err)
+	}
+	payload.StartTime = start
+
+	endRaw := fmt.Sprint(change["end_time"])
+	if endRaw != "" {
+		if end, err := parseEventTimestamp(endRaw); err == nil {
+			payload.EndTime = end
+		} else {
+			return payload, fmt.Errorf("invalid end_time: %w", err)
+		}
+	}
+	if payload.EndTime.IsZero() {
+		payload.EndTime = payload.StartTime.Add(time.Hour)
+	}
+
+	return payload, nil
+}
+
 func formatEventDateTime(dt *calendar.EventDateTime) (string, string, bool) {
 	if dt == nil {
 		return "", "", false
@@ -634,4 +820,28 @@ func determineChangeType(event *calendar.Event) string {
 	}
 
 	return "updated"
+}
+
+func parseEventTimestamp(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, fmt.Errorf("empty time")
+	}
+
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05-07:00",
+		"2006-01-02",
+	}
+
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t, nil
+		}
+		if t, err := time.ParseInLocation(layout, raw, time.Local); err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("could not parse time %q", raw)
 }

@@ -39,7 +39,7 @@ func TestHandleRegisterWebhook(t *testing.T) {
 
 	tokenStore := security.NewTokenStore(redisClient)
 	streamsHelper := streams.NewStreamsHelper(redisClient)
-	handler := NewCalendarWebhookHandler(redisClient, tokenStore, streamsHelper)
+	handler := NewCalendarWebhookHandler(redisClient, tokenStore, streamsHelper, nil)
 
 	t.Run("missing user_id", func(t *testing.T) {
 		reqBody := map[string]string{
@@ -98,7 +98,7 @@ func TestHandleWebhookNotification(t *testing.T) {
 	// Initialize components with real Redis
 	tokenStore := security.NewTokenStore(redisClient)
 	streamsHelper := streams.NewStreamsHelper(redisClient)
-	handler := NewCalendarWebhookHandler(redisClient, tokenStore, streamsHelper)
+	handler := NewCalendarWebhookHandler(redisClient, tokenStore, streamsHelper, nil)
 
 	// Test sync notification (validation)
 	t.Run("sync notification", func(t *testing.T) {
@@ -177,4 +177,3 @@ func TestHandleWebhookNotification(t *testing.T) {
 		}
 	})
 }
-

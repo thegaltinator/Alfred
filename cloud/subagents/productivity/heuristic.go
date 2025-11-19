@@ -44,6 +44,7 @@ type EventHeuristic struct {
 // ExpectedAppsGenerator produces the expected apps/tabs list for an event.
 type ExpectedAppsGenerator interface {
 	ExpectedApps(ctx context.Context, payload EventPayload) ([]string, error)
+	ClassifyForeground(ctx context.Context, payload EventPayload, foreground string) (bool, error)
 }
 
 // HeuristicStore persists heuristics in Redis keyed by user + event.
@@ -245,6 +246,41 @@ func (s *HeuristicService) CompareForeground(ctx context.Context, userID, foregr
 		return heuristic, false, err
 	}
 	return heuristic, ForegroundMatches(heuristic, foreground), nil
+}
+
+func (s *HeuristicService) ClassifyMismatch(ctx context.Context, heuristic *EventHeuristic, foreground string) (bool, error) {
+	if s == nil {
+		return false, errors.New("heuristic service not initialized")
+	}
+	if heuristic == nil {
+		return false, errors.New("heuristic is required")
+	}
+
+	// Reconstruct payload
+	payload := EventPayload{
+		UserID:      heuristic.UserID,
+		EventID:     heuristic.EventID,
+		Title:       heuristic.Title,
+		Description: heuristic.Description,
+		StartTime:   heuristic.StartTime,
+		EndTime:     heuristic.EndTime,
+	}
+
+	isMatch, err := s.generator.ClassifyForeground(ctx, payload, foreground)
+	if err != nil {
+		return false, err
+	}
+
+	if isMatch {
+		// Update and save
+		heuristic.ExpectedApps = append(heuristic.ExpectedApps, foreground)
+		if err := s.store.Save(ctx, heuristic); err != nil {
+			return true, fmt.Errorf("save updated heuristic: %w", err)
+		}
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // ForegroundMatches performs a simple, extendable comparison of the active app/tab.

@@ -121,6 +121,90 @@ func (g *NanoGenerator) ExpectedApps(ctx context.Context, payload EventPayload) 
 	return apps, nil
 }
 
+// ClassifyForeground asks the model if the foreground app/window matches the event.
+func (g *NanoGenerator) ClassifyForeground(ctx context.Context, payload EventPayload, foreground string) (bool, error) {
+	if g == nil {
+		return false, errors.New("nano generator not initialized")
+	}
+
+	// Prompt for classification
+	userContent := fmt.Sprintf(
+		"Task: %s\nDescription: %s\n\nCurrent Foreground: %s\n\nIs this foreground app/window essential for the task? Return JSON: {\"match\": true/false}",
+		payload.Title,
+		payload.Description,
+		foreground,
+	)
+
+	req := chatCompletionRequest{
+		Model: g.model,
+		Messages: []chatMessage{
+			{Role: "system", Content: "You are a productivity assistant. Decide if the user's current foreground app/window matches their scheduled task."},
+			{Role: "user", Content: userContent},
+		},
+		ResponseFormat: &responseFormat{
+			Type: "json_object",
+		},
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return false, fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, g.apiURL, bytes.NewReader(body))
+	if err != nil {
+		return false, fmt.Errorf("build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+g.apiKey)
+
+	resp, err := g.client.Do(httpReq)
+	if err != nil {
+		return false, fmt.Errorf("call nano model: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		return false, fmt.Errorf("nano model error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var parsed chatCompletionResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return false, fmt.Errorf("decode response: %w", err)
+	}
+
+	if len(parsed.Choices) == 0 {
+		return false, errors.New("empty response from model")
+	}
+
+	content := parsed.Choices[0].Message.Content
+	var result struct {
+		Match bool `json:"match"`
+	}
+	// Handle potential markdown wrapping
+	if strings.Contains(content, "```") {
+		content = strings.TrimPrefix(content, "```json")
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+	}
+
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		// Fallback: look for "true" in text if JSON fails
+		lower := strings.ToLower(content)
+		if strings.Contains(lower, "true") {
+			return true, nil
+		}
+		return false, nil // Default to false on parse error
+	}
+
+	return result.Match, nil
+}
+
 type ExpectedAppsResponse struct {
 	Apps          []string `json:"apps"`
 	Domains       []string `json:"domains"`
