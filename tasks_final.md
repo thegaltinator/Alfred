@@ -133,10 +133,24 @@ Test: POST with existing events + "coding 10–12" → DayPlan includes those bl
 - **End:** local endpoint applies a proposal to real calendar **only when told** (no Talker yet).
 - **Test:** call confirm → real event updated.
 
-### D-03 Productivity subagent: expected-apps store (Nano)
-- **Start:** heartbeats only.
-- **End:** keep per-activity expected apps (seed from Planner tool or config).
-- **Test:** update plan → store reflects new set.
+###D-03 Productivity subagent (GPT-5 Nano) — Hybrid Heuristic (authoritative expected apps)
+
+Start: heartbeats only.
+
+End: Implement the hybrid heuristic that produces the authoritative expected_apps for the current time block. Inputs:
+
+Current DayPlan block (label/priority/notes)
+
+Local memory (user app/tool prefs)
+
+Historical allowlist + recent foreground usage (from heartbeats)
+
+Time-of-day + recency bias
+Output: ranked expected_apps[] (bundle IDs) with confidence + TTL (expires at next block boundary).
+
+Keep state internally; never invent DayPlan—only interpret it.
+
+Test: With a DayPlan that has a "coding" block, Productivity emits prod.expected_apps.updated containing a ranked list like [com.microsoft.VSCode, com.google.Chrome] with TTL up to block end.
 
 ### D-04 Productivity classifier (2-minute rule)
 - **Start:** no decisions.
