@@ -101,10 +101,23 @@ No stubs or fakes anywhere.
 - **End:** normalize deltas to `user:{id}:in:calendar`.
 - **Test:** move an event → stream item appears.
 
-### C-11 Planner tool (Mini)
-- **Start:** none.
-- **End:** `/planner/run` (GPT-5 Mini) returns `expected_apps`, notes, proposals; **no external writes**.
-- **Test:** POST “coding 10–12” → non-empty `expected_apps`.
+###C-11 Planner tool (Mini) — DayPlan generator & re-planner
+
+Start: none.
+
+End: /planner/run (GPT-5 Mini) returns a DayPlan from now using prefs/memory and current calendar (shadow + read-only real):
+
+plan_id, version
+
+timeline[] blocks {start, end, label, priority, notes}
+
+conflicts[] (overlaps, travel gaps)
+
+rationale (short text)
+
+No expected apps; no external writes
+
+Test: POST with existing events + "coding 10–12" → DayPlan includes those blocks; conflicts listed if overlaps; no expected_apps anywhere.
 
 ---
 
