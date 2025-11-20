@@ -99,3 +99,31 @@ github_key.txt
 Application Support/Alfred/Models/*.gguf  # Large model files
 Application Support/Alfred/*.db
 Library/Application Support/Alfred/memory.db
+
+# =============================================================================
+# ⚠️  PRODUCTION KEY PROTECTION - NEVER DELETE THESE SECTIONS ⚠️
+# =============================================================================
+# CRITICAL: These patterns protect all environment and key files
+# Environment backups (to prevent accidental deletion)
+cloud/.env.backup
+cloud/.env.prod
+cloud/.env.production
+**/*.env.bak
+**/keybackup/
+
+# Key protection patterns
+**/*API_KEY*
+**/*API_KEY*
+**/*DEEPINFRA*
+**/*CEREBRAS*
+**/*QWEN*
+**/*PRODUCTIVITY*
+**/*EMAIL_TRIAGE*
+
+# Critical model files protection
+**/Qwen3-Embedding-0.6B-f16.gguf
+**/Models/Qwen3-Embedding-0.6B-f16.gguf
+Library/Application Support/Alfred/Models/
+# =============================================================================
+# ⚠️  END PROTECTION SECTION ⚠️
+# =============================================================================
