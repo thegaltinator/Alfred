@@ -18,6 +18,16 @@ func (s *staticGenerator) ExpectedApps(ctx context.Context, payload EventPayload
 	return append([]string(nil), s.apps...), nil
 }
 
+func (s *staticGenerator) ClassifyForeground(ctx context.Context, payload EventPayload, foreground string) (bool, error) {
+	// Simple implementation: check if foreground app is in the expected apps list
+	for _, app := range s.apps {
+		if app == foreground {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func TestHeuristicServiceUpsertAndCompare(t *testing.T) {
 	client, cleanup := newTestRedis(t)
 	defer cleanup()
