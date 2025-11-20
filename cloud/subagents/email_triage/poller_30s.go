@@ -19,23 +19,18 @@ const (
 	gmailListPageSize int64 = 50
 )
 
-// EmailMessage represents a processed email message
+// EmailMessage represents a raw email message from Gmail (pre-classification)
 type EmailMessage struct {
-	ID               string    `json:"id"`
-	ThreadID         string    `json:"thread_id"`
-	Subject          string    `json:"subject"`
-	From             string    `json:"from"`
-	To               []string  `json:"to"`
-	Date             time.Time `json:"date"`
-	Snippet          string    `json:"snippet"`
-	BodyText         string    `json:"body_text,omitempty"`
-	RequiresResponse bool      `json:"requires_response"`
-	Summary          string    `json:"summary"`
-	DraftReply       string    `json:"draft_reply"`
-	Classification   string    `json:"classification"` // FYI, Action Required, Question, etc.
-	Priority         string    `json:"priority"`       // High, Medium, Low
-	Timestamp        time.Time `json:"timestamp"`
-	UserID           string    `json:"user_id"`
+	ID        string    `json:"id"`
+	ThreadID  string    `json:"thread_id"`
+	Subject   string    `json:"subject"`
+	From      string    `json:"from"`
+	To        []string  `json:"to"`
+	Date      time.Time `json:"date"`
+	Snippet   string    `json:"snippet"`
+	BodyText  string    `json:"body_text,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+	UserID    string    `json:"user_id"`
 }
 
 // EmailPoller polls Gmail for new messages every 30 seconds
@@ -45,6 +40,7 @@ type EmailPoller struct {
 	userIDs        []string
 	pollInterval   time.Duration
 	lastMessageIDs map[string]string // userID -> last message ID
+	startupTime    time.Time         // NEW: Track when poller started
 	stopChan       chan struct{}
 	running        bool
 }
@@ -57,6 +53,7 @@ func NewEmailPoller(googleClient *security.GoogleServiceClient, redisClient *red
 		userIDs:        userIDs,
 		pollInterval:   30 * time.Second,
 		lastMessageIDs: make(map[string]string),
+		startupTime:    time.Now(), // NEW: Record when poller started
 		stopChan:       make(chan struct{}),
 		running:        false,
 	}
@@ -184,17 +181,21 @@ func (p *EmailPoller) pollUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-// initializeLastMessageID initializes the last message ID for a user
+// initializeLastMessageID initializes the last message ID for a user using timestamp filtering
 func (p *EmailPoller) initializeLastMessageID(ctx context.Context, userID string) error {
 	service, err := p.googleClient.GetGmailService(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get Gmail service: %w", err)
 	}
 
-	// Get the most recent message - use "me" as the user ID for Gmail API
+	// Only look for emails received after poller startup (with 5-minute buffer for clock sync)
+	sinceTime := p.startupTime.Add(-5 * time.Minute)
+	query := fmt.Sprintf("is:unread category:primary after:%d", sinceTime.Unix())
+
+	// Get the most recent message received after startup time
 	response, err := service.Users.Messages.List("me").
 		MaxResults(1).
-		Q("is:unread").
+		Q(query).
 		Do()
 	if err != nil {
 		return fmt.Errorf("failed to list messages: %w", err)
@@ -202,8 +203,10 @@ func (p *EmailPoller) initializeLastMessageID(ctx context.Context, userID string
 
 	if len(response.Messages) > 0 {
 		p.lastMessageIDs[userID] = response.Messages[0].Id
-		log.Printf("Initialized last message ID for user %s: %s", userID, p.lastMessageIDs[userID])
+		log.Printf("Initialized last message ID for user %s: %s (emails since %s)", userID, p.lastMessageIDs[userID], sinceTime.Format("2006-01-02 15:04:05"))
 		p.persistLastMessageID(ctx, userID, p.lastMessageIDs[userID])
+	} else {
+		log.Printf("No unread messages found since startup time %s for user %s", sinceTime.Format("2006-01-02 15:04:05"), userID)
 	}
 
 	return nil
@@ -216,8 +219,10 @@ func (p *EmailPoller) getNewMessages(ctx context.Context, service *gmail.Service
 	var pendingIDs []string
 
 	for {
+		// Add timestamp filtering for extra safety - only look for emails since startup
+		query := fmt.Sprintf("is:unread category:primary after:%d", p.startupTime.Add(-5*time.Minute).Unix())
 		listCall := service.Users.Messages.List("me").
-			Q("is:unread").
+			Q(query).
 			MaxResults(gmailListPageSize)
 
 		if pageToken != "" {
@@ -285,12 +290,6 @@ func (p *EmailPoller) processMessage(ctx context.Context, service *gmail.Service
 	// Get message body
 	bodyText := p.extractPlainText(message)
 
-	// Classify and summarize the message
-	classification, summary, draftReply, requiresResponse := p.classifyMessage(subject, from, bodyText)
-
-	// Determine priority
-	priority := p.determinePriority(subject, from, classification)
-
 	// Parse date
 	var messageDate time.Time
 	if message.InternalDate != 0 {
@@ -300,21 +299,16 @@ func (p *EmailPoller) processMessage(ctx context.Context, service *gmail.Service
 	}
 
 	processedMessage := &EmailMessage{
-		ID:               message.Id,
-		ThreadID:         message.ThreadId,
-		Subject:          subject,
-		From:             from,
-		To:               to,
-		Date:             messageDate,
-		Snippet:          message.Snippet,
-		BodyText:         bodyText,
-		RequiresResponse: requiresResponse,
-		Summary:          summary,
-		DraftReply:       draftReply,
-		Classification:   classification,
-		Priority:         priority,
-		Timestamp:        time.Now(),
-		UserID:           userID,
+		ID:        message.Id,
+		ThreadID:  message.ThreadId,
+		Subject:   subject,
+		From:      from,
+		To:        to,
+		Date:      messageDate,
+		Snippet:   message.Snippet,
+		BodyText:  bodyText,
+		Timestamp: time.Now(),
+		UserID:    userID,
 	}
 
 	return processedMessage, nil
@@ -389,57 +383,10 @@ func collectNewMessageIDs(messageRefs []*gmail.Message, lastMessageID string) ([
 	return newIDs, false
 }
 
-// classifyMessage classifies a message and generates summary and draft
-func (p *EmailPoller) classifyMessage(subject, from, body string) (classification, summary, draftReply string, requiresResponse bool) {
-	// Simple classification logic - in a real implementation, this would use AI/ML
-	bodyLower := strings.ToLower(body)
-	subjectLower := strings.ToLower(subject)
+// Note: Classification logic has been moved to the EmailClassifier in classifier.go
+// This poller now only fetches raw emails from Primary category for processing
 
-	// Check for questions
-	if strings.Contains(subjectLower, "?") || strings.Contains(bodyLower, "?") {
-		classification = "Question"
-		requiresResponse = true
-		draftReply = "Thank you for your message. I'll review this and get back to you shortly."
-	} else if strings.Contains(subjectLower, "urgent") || strings.Contains(bodyLower, "urgent") {
-		classification = "Action Required"
-		requiresResponse = true
-		draftReply = "I've received your urgent request and will prioritize it accordingly."
-	} else if strings.Contains(subjectLower, "fwd:") || strings.Contains(subjectLower, "fyi") {
-		classification = "FYI"
-		requiresResponse = false
-		draftReply = ""
-	} else {
-		classification = "Information"
-		requiresResponse = strings.Contains(bodyLower, "please") || strings.Contains(bodyLower, "could you")
-		if requiresResponse {
-			draftReply = "Thank you for the information. I'll take a look and respond if needed."
-		}
-	}
-
-	// Generate summary
-	if len(body) > 200 {
-		summary = body[:200] + "..."
-	} else {
-		summary = body
-	}
-
-	return classification, summary, draftReply, requiresResponse
-}
-
-// determinePriority determines message priority
-func (p *EmailPoller) determinePriority(subject, from, classification string) string {
-	subjectLower := strings.ToLower(subject)
-
-	if strings.Contains(subjectLower, "urgent") || strings.Contains(subjectLower, "asap") {
-		return "High"
-	} else if classification == "Question" || classification == "Action Required" {
-		return "Medium"
-	} else {
-		return "Low"
-	}
-}
-
-// emitToInputStream emits a processed message to the email input stream
+// emitToInputStream emits a raw message to the email input stream for processing by the classifier
 func (p *EmailPoller) emitToInputStream(ctx context.Context, userID string, message *EmailMessage) error {
 	streamKey := fmt.Sprintf("user:%s:in:email", userID)
 
@@ -447,30 +394,25 @@ func (p *EmailPoller) emitToInputStream(ctx context.Context, userID string, mess
 	rawJSON, _ := json.Marshal(message)
 
 	values := map[string]interface{}{
-		"type":              "email_delta",
-		"user_id":           userID,
-		"message_id":        message.ID,
-		"thread_id":         message.ThreadID,
-		"subject":           message.Subject,
-		"from":              message.From,
-		"to":                strings.Join(message.To, ", "),
-		"to_json":           string(toJSON),
-		"summary":           message.Summary,
-		"snippet":           message.Snippet,
-		"classification":    message.Classification,
-		"priority":          message.Priority,
-		"requires_response": message.RequiresResponse,
-		"draft_reply":       message.DraftReply,
-		"timestamp":         message.Timestamp.UTC().Format(time.RFC3339Nano),
-		"received_at":       message.Date.UTC().Format(time.RFC3339Nano),
-		"raw_json":          string(rawJSON),
+		"type":         "email_delta",
+		"user_id":      userID,
+		"message_id":   message.ID,
+		"thread_id":    message.ThreadID,
+		"subject":      message.Subject,
+		"from":         message.From,
+		"to":           strings.Join(message.To, ", "),
+		"to_json":      string(toJSON),
+		"snippet":      message.Snippet,
+		"timestamp":    message.Timestamp.UTC().Format(time.RFC3339Nano),
+		"received_at":  message.Date.UTC().Format(time.RFC3339Nano),
+		"raw_json":     string(rawJSON),
 	}
 
 	if message.BodyText != "" {
 		values["body_preview"] = truncateString(message.BodyText, 512)
 	}
 
-	// Add to Redis stream
+	// Add to Redis stream for classification by email triage subagent
 	if err := p.redisClient.XAdd(ctx, &redis.XAddArgs{
 		Stream: streamKey,
 		Values: values,
@@ -478,7 +420,7 @@ func (p *EmailPoller) emitToInputStream(ctx context.Context, userID string, mess
 		return fmt.Errorf("failed to append message to stream: %w", err)
 	}
 
-	log.Printf("Emitted email message %s to stream %s", message.ID, streamKey)
+	log.Printf("Emitted raw email message %s to stream %s for classification", message.ID, streamKey)
 	return nil
 }
 
