@@ -24,7 +24,7 @@ cloud-dev:
 		echo "❌ Go module not found. Run 'make cloud-setup' first."; \
 		exit 1; \
 	fi
-	@cd cloud && go mod tidy && go run api/main.go
+	@cd cloud && go mod tidy && ls *.go | grep -v "_test.go" | xargs go run
 
 # Clean build artifacts
 clean:
@@ -57,7 +57,7 @@ client:
 # Build cloud only
 cloud:
 	@echo "🏗️ Building Alfred cloud server..."
-	@cd cloud && go build -o cloud api/main.go
+	@cd cloud && go build -o cloud main.go
 	@echo "✅ Cloud build complete"
 
 # Test targets

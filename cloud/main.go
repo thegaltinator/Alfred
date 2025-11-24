@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"alfred-cloud/subagents/calendar_planner"
 	"alfred-cloud/subagents/email_triage"
 	"alfred-cloud/subagents/productivity"
+	"alfred-cloud/wb"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
@@ -31,11 +33,24 @@ const VERSION = "0.0.1"
 
 func main() {
 	// Load .env file
-	if err := godotenv.Load(); err != nil {
+	loadedEnv := false
+	if err := godotenv.Load(); err == nil {
+		loadedEnv = true
+	}
+	if err := godotenv.Load("cloud/.env"); err == nil {
+		loadedEnv = true
+	}
+	if !loadedEnv {
 		log.Println("Warning: .env file not found, using environment variables")
 	}
 
 	log.Println("Starting Alfred Cloud Server...")
+	if exePath, err := os.Executable(); err == nil {
+		log.Printf("Executable: %s", exePath)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		log.Printf("Working directory: %s", wd)
+	}
 
 	// Initialize Redis
 	redisURL := getEnv("REDIS_URL", "localhost:6379")
@@ -60,6 +75,7 @@ func main() {
 
 	// Initialize streams helper
 	streamsHelper := streams.NewStreamsHelper(redisClient)
+	wbBus := wb.NewBus(redisClient)
 
 	// Initialize productivity heuristic store (used by calendar events for expected apps)
 	prodHeuristicStore := productivity.NewHeuristicStore(redisClient)
@@ -79,8 +95,8 @@ func main() {
 	renewer.Start(ctx)
 
 	// Calendar pull sync fallback
-	pullEnabled := strings.ToLower(strings.TrimSpace(os.Getenv("CALENDAR_PULL_SYNC_ENABLED"))) != "false"
-	pullInterval := parseDurationOrDefault(os.Getenv("CALENDAR_PULL_SYNC_INTERVAL"), 3*time.Minute)
+	pullEnabled := true
+	pullInterval := 5 * time.Minute
 	pullLookback := parseDurationOrDefault(os.Getenv("CALENDAR_PULL_SYNC_LOOKBACK"), 48*time.Hour)
 	pullUsers := parseUserList("CALENDAR_PULL_SYNC_USERS", "test-user")
 	pullSync := NewCalendarPullSync(redisClient, calendarTokenStore, streamsHelper, prodHeuristicService, pullUsers, pullInterval, pullLookback, pullEnabled)
@@ -103,6 +119,25 @@ func main() {
 		}
 	}
 
+	// Initialize Email Triage Consumer
+	var emailConsumer *email_triage.EmailConsumer
+	emailTriageUsers := parseUserList("EMAIL_TRIAGE_USERS", getEnv("EMAIL_POLLER_USERS", "test-user"))
+	if len(emailTriageUsers) > 0 {
+		classifier, err := email_triage.NewEmailClassifier()
+		if err != nil {
+			log.Printf("Email triage consumer disabled: %v", err)
+		} else {
+			emailConsumer = email_triage.NewEmailConsumer(redisClient, classifier, emailTriageUsers)
+			go func() {
+				if err := emailConsumer.Start(ctx); err != nil {
+					log.Printf("Failed to start email consumer: %v", err)
+				}
+			}()
+		}
+	} else {
+		log.Println("Email triage consumer disabled: EMAIL_TRIAGE_USERS empty")
+	}
+
 	// Initialize Productivity Subagent (Consumer)
 	var productivityConsumer *productivity.ProductivityConsumer
 	prodUsers := parseUserList("PRODUCTIVITY_USERS", "test-user")
@@ -111,7 +146,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to init productivity classifier: %v", err)
 		}
-		
+
 		productivityConsumer = productivity.NewProductivityConsumer(redisClient, prodClassifier, prodHeuristicService, prodUsers)
 		go func() {
 			if err := productivityConsumer.Start(ctx); err != nil {
@@ -127,6 +162,12 @@ func main() {
 	shadowUsers := parseUserList("CALENDAR_SHADOW_USERS", "test-user")
 	if len(shadowUsers) > 0 {
 		plannerScript := strings.TrimSpace(os.Getenv("PLANNER_SCRIPT"))
+		if plannerScript == "" {
+			exePath, _ := os.Executable()
+			exeDir := filepath.Dir(exePath)
+			plannerScript = findFileUpwards(exeDir, "python_helper/planner_tool.py")
+		}
+		log.Printf("Planner script path: %s", plannerScript)
 		plannerRunner := calendar_planner.NewCalendarManagerService(plannerScript)
 		shadowService, err := calendar_planner.NewShadowCalendarService(redisClient, plannerRunner, calendar_planner.ShadowCalendarOptions{
 			UserIDs: shadowUsers,
@@ -162,6 +203,9 @@ func main() {
 	registerCalendarManagerRoutes(r)
 	registerShadowCalendarRoutes(r, shadowCalendarService)
 	registerProposalConfirmRoutes(r, shadowCalendarService, globalCalendarClient)
+	registerEmailTriageRoutes(r)
+	registerManagerRoutes(r)
+	registerWhiteboardRoutes(r, wbBus)
 
 	// Test endpoint to easily get auth URL
 	r.HandleFunc("/test/gmail-auth-url", getGmailAuthURL).Methods("GET")
@@ -195,7 +239,12 @@ func main() {
 	if emailPoller != nil {
 		emailPoller.Stop()
 	}
-	
+
+	// Stop email triage consumer
+	if emailConsumer != nil {
+		emailConsumer.Stop()
+	}
+
 	// Stop productivity consumer
 	if productivityConsumer != nil {
 		productivityConsumer.Stop()
@@ -316,6 +365,28 @@ func parseDurationOrDefault(raw string, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+func findFileUpwards(startDir, relativePath string) string {
+	dir := startDir
+	for {
+		if dir == "" || dir == "." {
+			break
+		}
+		candidate := filepath.Join(dir, relativePath)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	if abs, err := filepath.Abs(filepath.Join(startDir, relativePath)); err == nil {
+		return abs
+	}
+	return relativePath
 }
 
 // Initialize Google Auth with environment variables for main server

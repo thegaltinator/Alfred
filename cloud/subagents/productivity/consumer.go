@@ -12,19 +12,19 @@ import (
 )
 
 const (
-	ConsumerGroup   = "productivity-subagent"
-	ConsumerName    = "worker-1"
-	StreamKeyFormat = "user:%s:in:prod"
+	ConsumerGroup    = "productivity-subagent"
+	ConsumerName     = "worker-1"
+	StreamKeyFormat  = "user:%s:in:prod"
 	WhiteboardFormat = "user:%s:wb"
 )
 
 type ProductivityConsumer struct {
-	client      *redis.Client
-	classifier  *Classifier
-	heuristics  *HeuristicService
-	streams     *streams.StreamsHelper
-	userIDs     []string
-	stopChan    chan struct{}
+	client     *redis.Client
+	classifier *Classifier
+	heuristics *HeuristicService
+	streams    *streams.StreamsHelper
+	userIDs    []string
+	stopChan   chan struct{}
 }
 
 func NewProductivityConsumer(client *redis.Client, classifier *Classifier, heuristics *HeuristicService, userIDs []string) *ProductivityConsumer {
@@ -48,7 +48,7 @@ func (c *ProductivityConsumer) Start(ctx context.Context) error {
 	for _, userID := range c.userIDs {
 		key := fmt.Sprintf(StreamKeyFormat, userID)
 		streamKeys = append(streamKeys, key)
-		
+
 		// Create group (ignore if exists)
 		err := c.client.XGroupCreateMkStream(ctx, key, ConsumerGroup, "$").Err()
 		if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
@@ -111,7 +111,7 @@ func (c *ProductivityConsumer) processMessage(ctx context.Context, userID string
 	if _, ok := values["event_id"]; ok {
 		return c.handleActivityUpdate(ctx, userID, values)
 	}
-	
+
 	// Heartbeat: has "bundle_id" (or we assume it's heartbeat)
 	return c.handleHeartbeat(ctx, userID, values)
 }
@@ -121,11 +121,17 @@ func (c *ProductivityConsumer) handleActivityUpdate(ctx context.Context, userID 
 	payload := EventPayload{
 		UserID: userID,
 	}
-	
-	if v, ok := values["event_id"].(string); ok { payload.EventID = v }
-	if v, ok := values["title"].(string); ok { payload.Title = v }
-	if v, ok := values["description"].(string); ok { payload.Description = v }
-	
+
+	if v, ok := values["event_id"].(string); ok {
+		payload.EventID = v
+	}
+	if v, ok := values["title"].(string); ok {
+		payload.Title = v
+	}
+	if v, ok := values["description"].(string); ok {
+		payload.Description = v
+	}
+
 	// Parse times
 	if v, ok := values["start_time"].(string); ok {
 		t, _ := time.Parse(time.RFC3339, v)
@@ -143,19 +149,31 @@ func (c *ProductivityConsumer) handleActivityUpdate(ctx context.Context, userID 
 
 func (c *ProductivityConsumer) handleHeartbeat(ctx context.Context, userID string, values map[string]interface{}) error {
 	hb := Heartbeat{
-		UserID: userID,
+		UserID:    userID,
 		Timestamp: time.Now(), // Default
 	}
+	threadID := ""
 
-	if v, ok := values["bundle_id"].(string); ok { hb.BundleID = v }
-	if v, ok := values["window_title"].(string); ok { hb.WindowTitle = v }
-	if v, ok := values["url"].(string); ok { hb.URL = v }
-	if v, ok := values["activity_id"].(string); ok { hb.ActivityID = v }
-	
+	if v, ok := values["bundle_id"].(string); ok {
+		hb.BundleID = v
+	}
+	if v, ok := values["window_title"].(string); ok {
+		hb.WindowTitle = v
+	}
+	if v, ok := values["url"].(string); ok {
+		hb.URL = v
+	}
+	if v, ok := values["activity_id"].(string); ok {
+		hb.ActivityID = v
+	}
+
 	if v, ok := values["ts"].(string); ok {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			hb.Timestamp = t
 		}
+	}
+	if v, ok := values["thread_id"].(string); ok {
+		threadID = v
 	}
 
 	decision, err := c.classifier.ProcessHeartbeat(ctx, hb)
@@ -165,14 +183,18 @@ func (c *ProductivityConsumer) handleHeartbeat(ctx context.Context, userID strin
 
 	if decision != nil {
 		// Emit decision to whiteboard
-		return c.emitDecision(ctx, userID, decision)
+		return c.emitDecision(ctx, userID, threadID, decision)
 	}
 
 	return nil
 }
 
-func (c *ProductivityConsumer) emitDecision(ctx context.Context, userID string, decision *Decision) error {
+func (c *ProductivityConsumer) emitDecision(ctx context.Context, userID, threadID string, decision *Decision) error {
 	log.Printf("Emitting decision for %s: %s (%s)", userID, decision.Kind, decision.Observed)
+
+	if strings.TrimSpace(threadID) == "" {
+		threadID = "system"
+	}
 
 	wbKey := fmt.Sprintf(WhiteboardFormat, userID)
 
@@ -181,6 +203,7 @@ func (c *ProductivityConsumer) emitDecision(ctx context.Context, userID string, 
 		"decision": string(decision.Kind),
 		"ts":       time.Now().UTC().Format(time.RFC3339),
 	}
+	msg["thread_id"] = threadID
 
 	_, err := c.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: wbKey,
@@ -198,4 +221,3 @@ func extractUserID(streamKey string) string {
 	}
 	return "unknown"
 }
-

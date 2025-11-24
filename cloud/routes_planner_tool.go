@@ -156,12 +156,9 @@ func ensureCalendarManagerService() (*calendar_planner.CalendarManagerService, e
 	calendarManagerInitOnce.Do(func() {
 		scriptPath := strings.TrimSpace(os.Getenv("PLANNER_SCRIPT"))
 		if scriptPath == "" {
-			scriptPath = "../python_helper/planner_tool.py"
-		}
-		if !filepath.IsAbs(scriptPath) {
-			if abs, err := filepath.Abs(scriptPath); err == nil {
-				scriptPath = abs
-			}
+			exePath, _ := os.Executable()
+			exeDir := filepath.Dir(exePath)
+			scriptPath = findFileUpwards(exeDir, "python_helper/planner_tool.py")
 		}
 
 		if _, err := os.Stat(scriptPath); err != nil {

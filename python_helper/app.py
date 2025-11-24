@@ -112,8 +112,32 @@ def emit_response(payload: dict | str) -> None:
 
 def main() -> None:
     load_env()
-    resources = Resources()
     print("🧠 python_helper ready", file=sys.stderr)
+
+    # --- DEBUG BYPASS (env-controlled) ---
+    debug_bypass = os.environ.get("DEBUG_BYPASS", "").lower() in {"1", "true", "yes"}
+    if debug_bypass:
+        print("⚠️ DEBUG_BYPASS ENABLED: Skipping model loading and logic", file=sys.stderr)
+        for raw in sys.stdin:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                # Just parse to ensure valid JSON, then return dummy response
+                req = ChatRequest.model_validate_json(line)
+                dummy_response = ChatResponse(
+                    assistant_text=f"DEBUG ECHO: {req.user_text}",
+                    used_memory=[],
+                    latency_ms=0,
+                    token_usage=TokenUsage(prompt=0, completion=0)
+                )
+                emit_response(dummy_response.model_dump())
+            except Exception as e:
+                emit_response({"error": f"bypass_error: {e}"})
+        return
+    # --- DEBUG BYPASS END ---
+
+    resources = Resources()
     for raw in sys.stdin:
         line = raw.strip()
         if not line:

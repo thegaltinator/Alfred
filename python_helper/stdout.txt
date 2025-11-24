@@ -1,0 +1,1 @@
+{"assistant_text": "Hello! How can I assist you today?", "used_memory": [{"id": 1, "score": 0.5775694847106934}], "latency_ms": 841, "token_usage": {"prompt": 120, "completion": 84}}

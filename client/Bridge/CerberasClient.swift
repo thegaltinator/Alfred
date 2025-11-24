@@ -5,16 +5,14 @@ struct CerberasClient {
     let baseURL: String
     let apiKey: String
 
-    init(model: String, baseURL: String = "https://api.cerebras.ai/v1", apiKey: String?) {
+    init?(model: String, baseURL: String = "https://api.cerebras.ai/v1", apiKey: String?) {
+        guard let apiKey, !apiKey.isEmpty else { return nil }
         self.model = model
         self.baseURL = baseURL
-        guard let apiKey, !apiKey.isEmpty else {
-            fatalError("CerberasClient: missing API key")
-        }
         self.apiKey = apiKey
     }
 
-    func sendMessage(_ message: String, onUpdate: @escaping (String) -> Void) async throws -> String {
+    func streamMessage(_ message: String, onUpdate: @escaping (String) -> Void) async throws -> String {
         let url = URL(string: "\(baseURL)/chat/completions")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -26,58 +24,48 @@ struct CerberasClient {
             "messages": [
                 ["role": "user", "content": message]
             ],
-            "temperature": 0.7
+            "temperature": 0.7,
+            "stream": true
         ]
 
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw CerberasError.invalidResponse
         }
-
         guard httpResponse.statusCode == 200 else {
-            throw CerberasError.apiError(httpResponse.statusCode, String(decoding: data, as: UTF8.self))
+            throw CerberasError.apiError(httpResponse.statusCode, "non-200 response from Cerberas")
         }
 
-        let responseText = try parseResponseText(from: data)
-        onUpdate(responseText)
-        return responseText
+        var finalText = ""
+        for try await line in bytes.lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("data:") else { continue }
+
+            let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" { break }
+            guard let chunkData = payload.data(using: .utf8) else { continue }
+
+            if let chunk = try? JSONDecoder().decode(StreamChunk.self, from: chunkData) {
+                if let delta = chunk.choices.first?.delta?.content ?? chunk.choices.first?.text, !delta.isEmpty {
+                    finalText.append(delta)
+                    onUpdate(finalText)
+                }
+            }
+        }
+        return finalText
     }
 
-    private func parseResponseText(from data: Data) throws -> String {
-        struct ChatCompletion: Decodable {
-            struct Choice: Decodable {
-                struct Message: Decodable {
-                    let content: String
-                }
-                let message: Message?
-                let text: String?
+    private struct StreamChunk: Decodable {
+        struct Choice: Decodable {
+            struct Delta: Decodable {
+                let content: String?
             }
-            let choices: [Choice]
+            let delta: Delta?
+            let text: String?
         }
-
-        if let completion = try? JSONDecoder().decode(ChatCompletion.self, from: data) {
-            if let text = completion.choices.first?.message?.content, !text.isEmpty {
-                return text
-            }
-            if let text = completion.choices.first?.text, !text.isEmpty {
-                return text
-            }
-        }
-
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let response = json["response"] as? String {
-                return response
-            }
-            if let output = json["output"] as? [[String: Any]],
-               let text = output.first?["content"] as? String {
-                return text
-            }
-        }
-
-        return String(decoding: data, as: UTF8.self)
+        let choices: [Choice]
     }
 
     enum CerberasError: Error, LocalizedError {

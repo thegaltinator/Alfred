@@ -234,7 +234,7 @@ func (h *GoogleAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Reques
 	_, err = client.ExchangeCodeForToken(ctx, service, userID, code, state)
 	if err != nil {
 		log.Printf("Failed to exchange code for token: %v", err)
-		http.Error(w, "Failed to exchange authorization code for token", http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to exchange authorization code for token: %v", err), http.StatusInternalServerError)
 		return
 	}
 

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"alfred-cloud/streams"
@@ -15,6 +16,7 @@ type HeartbeatRequest struct {
 	URL         string `json:"url"`
 	ActivityID  string `json:"activity_id"`
 	Timestamp   string `json:"ts"`
+	ThreadID    string `json:"thread_id"`
 }
 
 func registerProdHeuristicRoutes(r *mux.Router, streams *streams.StreamsHelper) {
@@ -39,6 +41,9 @@ func registerProdHeuristicRoutes(r *mux.Router, streams *streams.StreamsHelper) 
 		if values["ts"] == "" {
 			values["ts"] = time.Now().UTC().Format(time.RFC3339)
 		}
+		if strings.TrimSpace(payload.ThreadID) != "" {
+			values["thread_id"] = strings.TrimSpace(payload.ThreadID)
+		}
 
 		streamKey := "user:" + userID + ":in:prod"
 		_, err := streams.AppendToStream(req.Context(), streamKey, values)
@@ -50,4 +55,3 @@ func registerProdHeuristicRoutes(r *mux.Router, streams *streams.StreamsHelper) 
 		w.WriteHeader(http.StatusAccepted)
 	}).Methods("POST")
 }
-
