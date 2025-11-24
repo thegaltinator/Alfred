@@ -36,9 +36,11 @@ func NewRuntimeFromEnv(ctx context.Context) (*Runtime, error) {
 		return nil, err
 	}
 
+	bus := wb.NewBus(client)
 	graph, err := NewManagerGraph(GraphConfig{
 		PlannerURL:     cfg.PlannerURL,
 		ProdControlURL: cfg.ProdControlURL,
+		Bus:            bus,
 	})
 	if err != nil {
 		return nil, err
@@ -47,7 +49,7 @@ func NewRuntimeFromEnv(ctx context.Context) (*Runtime, error) {
 	return &Runtime{
 		cfg:     cfg,
 		redis:   client,
-		bus:     wb.NewBus(client),
+		bus:     bus,
 		graph:   graph,
 		lastIDs: map[string]map[string]string{
 			// init lazily per user
